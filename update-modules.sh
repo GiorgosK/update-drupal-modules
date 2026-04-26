@@ -86,6 +86,30 @@ is_core_package() {
   esac
 }
 
+order_modules_core_last() {
+  local module
+  local non_core_modules=()
+  local core_modules=()
+
+  for module in "$@"; do
+    if is_core_package "$(normalize_module_name "$module")"; then
+      core_modules+=("$module")
+    else
+      non_core_modules+=("$module")
+    fi
+  done
+
+  MODULES=("${non_core_modules[@]}" "${core_modules[@]}")
+}
+
+get_composer_update_dependency_option() {
+  if is_core_package "$1"; then
+    echo "--with-all-dependencies"
+  else
+    echo "--with-dependencies"
+  fi
+}
+
 #########################################
 # OUTDATED MODULE LIST
 #########################################
@@ -108,6 +132,17 @@ get_locked_drupal_packages() {
   jq -r '.packages[] | select(.name | startswith("drupal/")) | [.name, .version] | @tsv' composer.lock
 }
 
+get_locked_package_version() {
+  local package="$1"
+
+  jq -r --arg package "$package" '
+    ((.packages // []) + (."packages-dev" // []))
+    | .[]
+    | select(.name == $package)
+    | .version
+  ' composer.lock | head -n 1
+}
+
 version_to_constraint() {
   local version="${1#v}"
   local major minor
@@ -128,22 +163,40 @@ version_to_constraint() {
 
 composer_update_module_safely() {
   local module="$1"
-  local before_lock after_lock installed_modules removed_packages protected_packages package version constraint
+  local before_lock after_lock before_composer_json before_composer_lock installed_modules removed_packages protected_packages package version constraint old_locked_version new_locked_version dependency_option
+
+  dependency_option=$(get_composer_update_dependency_option "$module")
 
   if $DRY_RUN; then
-    run_cmd "$COMPOSER update $module --dry-run"
+    run_cmd "$COMPOSER update $module $dependency_option --dry-run"
     return
   fi
 
   before_lock=$(mktemp)
   after_lock=$(mktemp)
+  before_composer_json=$(mktemp)
+  before_composer_lock=$(mktemp)
   installed_modules=$(mktemp)
   removed_packages=$(mktemp)
+
+  cp composer.json "$before_composer_json"
+  cp composer.lock "$before_composer_lock"
+  old_locked_version=$(get_locked_package_version "$module")
 
   get_locked_drupal_packages | sort > "$before_lock"
   get_installed_drupal_module_packages | sort > "$installed_modules"
 
-  run_cmd "$COMPOSER update $module --no-install"
+  run_cmd "$COMPOSER update $module $dependency_option --no-install"
+
+  new_locked_version=$(get_locked_package_version "$module")
+
+  if [[ "$new_locked_version" == "$old_locked_version" ]]; then
+    cp "$before_composer_json" composer.json
+    cp "$before_composer_lock" composer.lock
+    rm -f "$before_lock" "$after_lock" "$before_composer_json" "$before_composer_lock" "$installed_modules" "$removed_packages"
+    echo "ℹ️ Composer did not change $module in composer.lock; skipping Drush and commit."
+    return 1
+  fi
 
   get_locked_drupal_packages | sort > "$after_lock"
 
@@ -167,12 +220,12 @@ composer_update_module_safely() {
       protected_packages+=("$package")
     done < "$removed_packages"
 
-    run_cmd "$COMPOSER update $module ${protected_packages[*]}"
+    run_cmd "$COMPOSER update $module ${protected_packages[*]} $dependency_option"
   else
     run_cmd "$COMPOSER install"
   fi
 
-  rm -f "$before_lock" "$after_lock" "$installed_modules" "$removed_packages"
+  rm -f "$before_lock" "$after_lock" "$before_composer_json" "$before_composer_lock" "$installed_modules" "$removed_packages"
 }
 
 #########################################
@@ -225,7 +278,9 @@ update_module() {
   # Composer update
   #########################################
 
-  composer_update_module_safely "$MODULE"
+  if ! composer_update_module_safely "$MODULE"; then
+    return
+  fi
 
   #########################################
   # Version after update
@@ -299,6 +354,8 @@ else
   echo "🔍 Detecting outdated Drupal modules..."
   mapfile -t MODULES < <(get_outdated_modules)
 fi
+
+order_modules_core_last "${MODULES[@]}"
 
 for MODULE in "${MODULES[@]}"; do
   update_module "$MODULE"
