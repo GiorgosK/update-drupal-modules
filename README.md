@@ -8,6 +8,9 @@ This is vibe coded bash script to help ease the pain of updating drupal contrib 
 - it lets module dependencies update when needed
 - core is skipped unless you pass `--allow-core`
 - if core is allowed, it updates contrib modules first and core last
+- core updates go one minor version at a time
+- core can update related drupal packages when composer needs that to resolve
+- `--allow-major` also updates the package constraint in composer.json
 - updates the database `drush updb`
 - exports any configuration changes `drush cex` 
 - and commits with sensible message
@@ -24,6 +27,9 @@ This is vibe coded bash script to help ease the pain of updating drupal contrib 
 - skips core updates unless `--allow-core` is used
 - skips major upgrades unless `--allow-major` is used
 - keeps core dependency updates for the core pass
+- stops core updates if composer cannot resolve the next minor step
+- checks `drush status` after each core step before committing and continuing
+- restores composer files if composer cannot resolve an update
 - runs modules one at a time, with database updates and config export after each one
 - skips drush and commit if composer does not change the package in the lock file
 - prevents composer removing a module that was deprecated in a newer version while drupal still has it installed
