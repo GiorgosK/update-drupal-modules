@@ -96,6 +96,86 @@ get_outdated_modules() {
 }
 
 #########################################
+# DRUPAL/COMPOSER SAFETY HELPERS
+#########################################
+
+get_installed_drupal_module_packages() {
+  $DRUSH cget core.extension module --format=json \
+    | jq -r '."core.extension:module" | keys[] | "drupal/" + .'
+}
+
+get_locked_drupal_packages() {
+  jq -r '.packages[] | select(.name | startswith("drupal/")) | [.name, .version] | @tsv' composer.lock
+}
+
+version_to_constraint() {
+  local version="${1#v}"
+  local major minor
+
+  if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\. ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+
+    if [[ "$major" == "0" ]]; then
+      echo "^0.$minor"
+    else
+      echo "^$major.$minor"
+    fi
+  else
+    echo "$version"
+  fi
+}
+
+composer_update_module_safely() {
+  local module="$1"
+  local before_lock after_lock installed_modules removed_packages protected_packages package version constraint
+
+  if $DRY_RUN; then
+    run_cmd "$COMPOSER update $module --dry-run"
+    return
+  fi
+
+  before_lock=$(mktemp)
+  after_lock=$(mktemp)
+  installed_modules=$(mktemp)
+  removed_packages=$(mktemp)
+
+  get_locked_drupal_packages | sort > "$before_lock"
+  get_installed_drupal_module_packages | sort > "$installed_modules"
+
+  run_cmd "$COMPOSER update $module --no-install"
+
+  get_locked_drupal_packages | sort > "$after_lock"
+
+  comm -23 \
+    <(cut -f1 "$before_lock" | sort) \
+    <(cut -f1 "$after_lock" | sort) \
+    | while read -r package; do
+        if grep -qx "$package" "$installed_modules"; then
+          grep -F -m 1 "$package"$'\t' "$before_lock"
+        fi
+      done > "$removed_packages"
+
+  if [[ -s "$removed_packages" ]]; then
+    echo "⚠️ Composer would remove installed Drupal module code. Keeping these packages:"
+
+    protected_packages=()
+    while IFS=$'\t' read -r package version; do
+      constraint=$(version_to_constraint "$version")
+      echo "  - $package ($version, adding root constraint $constraint)"
+      run_cmd "$COMPOSER require $package:$constraint --no-update"
+      protected_packages+=("$package")
+    done < "$removed_packages"
+
+    run_cmd "$COMPOSER update $module ${protected_packages[*]}"
+  else
+    run_cmd "$COMPOSER install"
+  fi
+
+  rm -f "$before_lock" "$after_lock" "$installed_modules" "$removed_packages"
+}
+
+#########################################
 # UPDATE MODULE
 #########################################
 
@@ -145,7 +225,7 @@ update_module() {
   # Composer update
   #########################################
 
-  run_cmd "$COMPOSER update $MODULE"
+  composer_update_module_safely "$MODULE"
 
   #########################################
   # Version after update
